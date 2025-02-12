@@ -204,6 +204,247 @@ impl Build {
     }
 
     pub fn build_msvc(&mut self) -> Artifacts {
+        let target = self.target.as_ref().expect("TARGET not set");
+        let out_dir = self.out_dir.as_ref().expect("OUT_DIR not set");
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source_dir = manifest_dir.join("luajit2");
+        let extras_dir = manifest_dir.join("extras");
+        let build_dir = out_dir.join("build");
+        let lib_dir = out_dir.join("lib");
+        let include_dir = out_dir.join("include");
+    
+        // Crear directorios necesarios
+        self.create_directories(&[&build_dir, &lib_dir, &include_dir]);
+    
+        // Copiar fuentes de LuaJIT al directorio de construcción
+        cp_r(&source_dir, &build_dir);
+    
+        // Paso 1: Compilar minilua.c
+        let minilua_exe = self.compile_minilua(&build_dir);
+    
+        // Paso 2: Usar minilua.exe para generar archivos intermedios
+        self.generate_intermediate_files(&build_dir, &minilua_exe);
+    
+        // Paso 3: Compilar buildvm.c
+        let buildvm_exe = self.compile_buildvm(&build_dir);
+    
+        // Paso 4: Usar buildvm.exe para generar archivos adicionales
+        self.generate_vm_files(&build_dir, &buildvm_exe);
+    
+        // Paso 5: Compilar los archivos .c de LuaJIT
+        self.compile_luajit_sources(&build_dir);
+    
+        // Copiar archivos necesarios
+        self.copy_headers(&build_dir, &include_dir);
+    
+        // Generar biblioteca estática
+        self.generate_static_library(&build_dir, &lib_dir);
+    
+        Artifacts {
+            lib_dir,
+            include_dir,
+            libs: vec!["luajit".to_string()],
+        }
+    }
+    
+    fn create_directories(&self,dirs: &[&Path]) {
+        for dir in dirs {
+            if dir.exists() {
+                fs::remove_dir_all(dir).unwrap_or_else(|e| panic!("cannot remove {}: {}", dir.display(), e));
+            }
+            fs::create_dir_all(dir).unwrap_or_else(|e| panic!("cannot create {}: {}", dir.display(), e));
+        }
+    }
+    
+    fn compile_minilua(&self,build_dir: &Path) -> PathBuf {
+        let host_dir = build_dir.join("src").join("host");
+        let minilua_exe = build_dir.join("src").join("minilua.exe");
+    
+        let mut compile_minilua = Command::new("clang-cl");
+        compile_minilua.current_dir(&host_dir)
+            .arg("/c")
+            .arg("/I").arg(build_dir.join("src"))
+            .arg("/D_CRT_SECURE_NO_DEPRECATE")
+            .arg("/D_CRT_STDIO_INLINE=__declspec(dllexport)__inline")
+            .arg("/O2")
+            .arg("/W3")
+            .arg("/MD")
+            .arg(host_dir.join("minilua.c"));
+    
+        self.run_command(compile_minilua, "compiling minilua.c");
+    
+        let mut link_minilua = Command::new("lld-link");
+        link_minilua.current_dir(build_dir.join("src"))
+            .arg("/out:minilua.exe")
+            .arg(host_dir.join("minilua.obj"));
+    
+        self.run_command(link_minilua, "linking minilua.exe");
+    
+        minilua_exe
+    }
+    
+    fn generate_intermediate_files(&self,build_dir: &Path, minilua_exe: &Path) {
+        let mut generate_buildvm_arch = Command::new("wine64");
+        generate_buildvm_arch.current_dir(build_dir.join("src"))
+            .arg(minilua_exe)
+            .arg("../dynasm/dynasm.lua")
+            .arg("-LN")
+            .arg("-D").arg("WIN")
+            .arg("-D").arg("JIT")
+            .arg("-D").arg("FFI")
+            .arg("-D").arg("ENDIAN_LE")
+            .arg("-D").arg("FPU")
+            .arg("-D").arg("P64")
+            .arg("-o").arg("host/buildvm_arch.h")
+            .arg("vm_x64.dasc");
+    
+        self.run_command(generate_buildvm_arch, "generating buildvm_arch.h");
+    
+        let relver = build_dir.join(".relver");
+        let luajit_relver = build_dir.join("src").join("luajit_relver.txt");
+        fs::copy(&relver, &luajit_relver).unwrap();
+    
+        let mut create_luajit_h = Command::new("wine64");
+        create_luajit_h.current_dir(build_dir.join("src"))
+            .arg(minilua_exe)
+            .arg("host/genversion.lua");
+    
+        self.run_command(create_luajit_h, "generating luajit_h");
+    }
+    
+    fn compile_buildvm(&self,build_dir: &Path) -> PathBuf {
+        let buildvm_exe = build_dir.join("src").join("buildvm.exe");
+    
+        let mut compile_buildvm = Command::new("clang-cl");
+        compile_buildvm.current_dir(build_dir.join("src"))
+            .arg("/c")
+            .arg("/I").arg(build_dir.join("src"))
+            .arg("/D_CRT_SECURE_NO_DEPRECATE")
+            .arg("/D_CRT_STDIO_INLINE=__declspec(dllexport)__inline")
+            .arg("/O2")
+            .arg("/W3")
+            .arg("/MD")
+            .args(vec![
+                build_dir.join("src").join("host").join("buildvm.c"),
+                build_dir.join("src").join("host").join("buildvm_asm.c"),
+                build_dir.join("src").join("host").join("buildvm_fold.c"),
+                build_dir.join("src").join("host").join("buildvm_lib.c"),
+                build_dir.join("src").join("host").join("buildvm_peobj.c"),
+            ]);
+    
+        self.run_command(compile_buildvm, "compiling buildvm.c");
+    
+        let mut link_buildvm = Command::new("lld-link");
+        link_buildvm.current_dir(build_dir.join("src"))
+            .arg("/out:buildvm.exe")
+            .arg("buildvm.obj")
+            .arg("buildvm_asm.obj")
+            .arg("buildvm_fold.obj")
+            .arg("buildvm_lib.obj")
+            .arg("buildvm_peobj.obj");
+    
+        self.run_command(link_buildvm, "linking buildvm.exe");
+    
+        buildvm_exe
+    }
+    
+    fn generate_vm_files(&self,build_dir: &Path, buildvm_exe: &Path) {
+        let files_to_generate = [
+            ("peobj", "lj_vm.obj"),
+            ("bcdef", "lj_bcdef.h"),
+            ("ffdef", "lj_ffdef.h"),
+            ("libdef", "lj_libdef.h"),
+            ("recdef", "lj_recdef.h"),
+            ("vmdef", "jit/vmdef.lua"),
+            ("folddef", "lj_folddef.h"),
+        ];
+    
+        for (mode, output) in files_to_generate {
+            let mut cmd = Command::new("wine64");
+            cmd.current_dir(build_dir.join("src"))
+                .arg(buildvm_exe)
+                .arg("-m").arg(mode)
+                .arg("-o").arg(output);
+    
+            if mode != "peobj" && mode != "folddef" {
+                cmd.args(&[
+                    "lib_base.c", "lib_math.c", "lib_bit.c", "lib_string.c", "lib_table.c",
+                    "lib_io.c", "lib_os.c", "lib_package.c", "lib_debug.c", "lib_jit.c",
+                    "lib_ffi.c", "lib_buffer.c",
+                ]);
+            } else if mode == "folddef" {
+                cmd.arg("lj_opt_fold.c");
+            }
+    
+            self.run_command(cmd, &format!("generating {}", output));
+        }
+    }
+    
+    fn compile_luajit_sources(&self,build_dir: &Path) {
+        let src_dir = build_dir.join("src");
+        let c_files: Vec<_> = fs::read_dir(&src_dir)
+            .expect("No se pudo leer el directorio src")
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                if path.extension().map_or(false, |ext| ext == "c") {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect();
+    
+        let mut compile_luajit = Command::new("clang-cl");
+        compile_luajit.current_dir(&src_dir)
+            .arg("/c")
+            .arg("/I").arg(&src_dir)
+            .arg("/D_CRT_SECURE_NO_DEPRECATE")
+            .arg("/D_CRT_STDIO_INLINE=__declspec(dllexport)__inline")
+            .arg("/O2")
+            .arg("/W3")
+            .arg("/MD")
+            .args(&c_files);
+    
+        self.run_command(compile_luajit, "compiling LuaJIT sources");
+    }
+    
+    fn copy_headers(&self,build_dir: &Path, include_dir: &Path) {
+        for header in &["lauxlib.h", "lua.h", "luaconf.h", "luajit.h", "lualib.h"] {
+            fs::copy(build_dir.join("src").join(header), include_dir.join(header)).unwrap();
+        }
+    }
+    
+    fn generate_static_library(&self,build_dir: &Path, lib_dir: &Path) {
+        let obj_files: Vec<_> = fs::read_dir(build_dir.join("src"))
+            .expect("No se pudo leer el directorio src")
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                let file_name = path.file_name()?.to_str()?;
+                if (file_name.starts_with("lj_") && file_name.ends_with(".obj")) ||
+                   (file_name.starts_with("lib_") && file_name.ends_with(".obj")) {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect();
+    
+        let mut generate_lib = Command::new("llvm-lib");
+        generate_lib.current_dir(build_dir.join("src"))
+            .arg("/nologo")
+            .arg("/nodefaultlib")
+            .arg("/out:lua51.lib")
+            .args(&obj_files);
+    
+        self.run_command(generate_lib, "generate lua51.lib");
+    
+        fs::copy(
+            build_dir.join("src").join("lua51.lib"),
+            lib_dir.join("luajit.lib"),
+        ).unwrap();
+    }
+
+    pub fn _build_msvc(&mut self) -> Artifacts {
         let target = &self.target.as_ref().expect("TARGET not set")[..];
         let out_dir = self.out_dir.as_ref().expect("OUT_DIR not set");
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
