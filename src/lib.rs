@@ -268,7 +268,7 @@ impl Build {
             .arg("/D_CRT_STDIO_INLINE=__declspec(dllexport)__inline")
             .arg("/O2")
             .arg("/W3")
-            .arg("/MD")
+            .arg("/MT")
             .arg(host_dir.join("minilua.c"));
     
         self.run_command(compile_minilua, "compiling minilua.c");
@@ -323,7 +323,7 @@ impl Build {
             .arg("/D_CRT_STDIO_INLINE=__declspec(dllexport)__inline")
             .arg("/O2")
             .arg("/W3")
-            .arg("/MD")
+            .arg("/MT")
             .args(vec![
                 build_dir.join("src").join("host").join("buildvm.c"),
                 build_dir.join("src").join("host").join("buildvm_asm.c"),
@@ -402,7 +402,7 @@ impl Build {
             .arg("/D_CRT_STDIO_INLINE=__declspec(dllexport)__inline")
             .arg("/O2")
             .arg("/W3")
-            .arg("/MD")
+            .arg("/MT")
             .args(&c_files);
     
         self.run_command(compile_luajit, "compiling LuaJIT sources");
