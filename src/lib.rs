@@ -247,8 +247,14 @@ impl Build {
         Artifacts::make(&build_dir, &include_dir, &lib_dir, false)
     }
 
+    // Overa: cross-compiling to windows-msvc from Linux has no real MSVC install for
+    // luajit2's own msvcbuild.bat to run against (it needs a live `cl.exe`/vcvars
+    // environment, which `cc::windows_registry::find_tool` can never provide on a
+    // non-Windows host). We replicate what msvcbuild.bat does by hand with
+    // clang-cl + lld-link + llvm-lib, running the intermediate `minilua`/`buildvm`
+    // code-generator tools under Wine since they are Windows PE binaries that must
+    // execute *during* the build to produce LuaJIT's generated sources.
     fn build_msvc(&mut self) -> Result<Artifacts, DynError> {
-        let target = &self.target.as_ref().expect("TARGET is not set")[..];
         let out_dir = self.out_dir.as_ref().expect("OUT_DIR is not set");
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let source_dir = manifest_dir.join("luajit2");
@@ -270,26 +276,276 @@ impl Build {
         fs::copy(manifest_dir.join("luajit_relver.txt"), &relver)
             .context(|| "Cannot copy 'luajit_relver.txt'")?;
 
-        let mut msvcbuild = Command::new(build_dir.join("src").join("msvcbuild.bat"));
-        msvcbuild.current_dir(build_dir.join("src"));
+        let debug = self.debug.unwrap_or(cfg!(debug_assertions));
+        let lua52compat = self.lua52compat;
 
-        if self.lua52compat {
-            msvcbuild.arg("lua52compat");
-        }
-        if self.debug.unwrap_or(cfg!(debug_assertions)) {
-            msvcbuild.arg("debug");
-        }
-        msvcbuild.arg("static");
-
-        let cl = cc::windows_registry::find_tool(target, "cl.exe").expect("failed to find cl");
-        for (k, v) in cl.env() {
-            msvcbuild.env(k, v);
-        }
-
-        self.run_command(&mut msvcbuild)
-            .context(|| format!("Error running'{msvcbuild:?}'"))?;
+        let minilua_exe = self.compile_minilua(&build_dir)?;
+        self.generate_intermediate_files(&build_dir, &minilua_exe)?;
+        let buildvm_exe = self.compile_buildvm(&build_dir, lua52compat)?;
+        self.generate_vm_files(&build_dir, &buildvm_exe)?;
+        self.compile_luajit_sources(&build_dir, lua52compat, debug)?;
+        self.generate_static_library(&build_dir)?;
 
         Artifacts::make(&build_dir, &include_dir, &lib_dir, true)
+    }
+
+    fn compile_minilua(&self, build_dir: &Path) -> Result<PathBuf, DynError> {
+        let host_dir = build_dir.join("src").join("host");
+        let minilua_exe = build_dir.join("src").join("minilua.exe");
+
+        let mut compile_minilua = Command::new("clang-cl");
+        compile_minilua
+            .current_dir(&host_dir)
+            .arg("/c")
+            .arg("/I")
+            .arg(build_dir.join("src"))
+            .arg("/D_CRT_SECURE_NO_DEPRECATE")
+            .arg("/D_CRT_STDIO_INLINE=__declspec(dllexport)__inline")
+            .arg("/O2")
+            .arg("/W3")
+            .arg("/MT")
+            // clang-cl's cl.exe-compatible parser treats a bare argument starting with
+            // "/" as an (unrecognized, silently dropped) flag rather than a positional
+            // input -- and our absolute Unix paths all start with "/". `--` forces
+            // everything after it to be parsed as a positional file.
+            .arg("--")
+            .arg(host_dir.join("minilua.c"));
+        self.run_command(&mut compile_minilua)
+            .context(|| format!("Error running '{compile_minilua:?}'"))?;
+
+        let mut link_minilua = Command::new("lld-link");
+        link_minilua
+            .current_dir(build_dir.join("src"))
+            .arg("/out:minilua.exe")
+            .arg(host_dir.join("minilua.obj"));
+        self.run_command(&mut link_minilua)
+            .context(|| format!("Error running '{link_minilua:?}'"))?;
+
+        Ok(minilua_exe)
+    }
+
+    fn generate_intermediate_files(
+        &self,
+        build_dir: &Path,
+        minilua_exe: &Path,
+    ) -> Result<(), DynError> {
+        let mut generate_buildvm_arch = Command::new("wine64");
+        generate_buildvm_arch
+            .current_dir(build_dir.join("src"))
+            .arg(minilua_exe)
+            .arg("../dynasm/dynasm.lua")
+            .arg("-LN")
+            .arg("-D")
+            .arg("WIN")
+            .arg("-D")
+            .arg("JIT")
+            .arg("-D")
+            .arg("FFI")
+            .arg("-D")
+            .arg("ENDIAN_LE")
+            .arg("-D")
+            .arg("FPU")
+            .arg("-D")
+            .arg("P64")
+            .arg("-o")
+            .arg("host/buildvm_arch.h")
+            .arg("vm_x64.dasc");
+        self.run_command(&mut generate_buildvm_arch)
+            .context(|| format!("Error running '{generate_buildvm_arch:?}'"))?;
+
+        let relver = build_dir.join(".relver");
+        let luajit_relver = build_dir.join("src").join("luajit_relver.txt");
+        fs::copy(&relver, &luajit_relver).context(|| {
+            format!(
+                "Cannot copy '{}' to '{}'",
+                relver.display(),
+                luajit_relver.display()
+            )
+        })?;
+
+        let mut create_luajit_h = Command::new("wine64");
+        create_luajit_h
+            .current_dir(build_dir.join("src"))
+            .arg(minilua_exe)
+            .arg("host/genversion.lua");
+        self.run_command(&mut create_luajit_h)
+            .context(|| format!("Error running '{create_luajit_h:?}'"))?;
+
+        Ok(())
+    }
+
+    fn compile_buildvm(&self, build_dir: &Path, lua52compat: bool) -> Result<PathBuf, DynError> {
+        let src_dir = build_dir.join("src");
+        let buildvm_exe = src_dir.join("buildvm.exe");
+
+        let mut compile_buildvm = Command::new("clang-cl");
+        compile_buildvm
+            .current_dir(&src_dir)
+            .arg("/c")
+            .arg("/I")
+            .arg(&src_dir)
+            .arg("/D_CRT_SECURE_NO_DEPRECATE")
+            .arg("/D_CRT_STDIO_INLINE=__declspec(dllexport)__inline")
+            .arg("/O2")
+            .arg("/W3")
+            .arg("/MT");
+        if lua52compat {
+            compile_buildvm.arg("/DLUAJIT_ENABLE_LUA52COMPAT");
+        }
+        // See the comment on the minilua compile: forces positional parsing of the
+        // absolute Unix paths that follow, which clang-cl would otherwise treat as
+        // unrecognized "/"-prefixed flags and silently drop.
+        compile_buildvm.arg("--");
+        compile_buildvm.args([
+            src_dir.join("host").join("buildvm.c"),
+            src_dir.join("host").join("buildvm_asm.c"),
+            src_dir.join("host").join("buildvm_fold.c"),
+            src_dir.join("host").join("buildvm_lib.c"),
+            src_dir.join("host").join("buildvm_peobj.c"),
+        ]);
+        self.run_command(&mut compile_buildvm)
+            .context(|| format!("Error running '{compile_buildvm:?}'"))?;
+
+        let mut link_buildvm = Command::new("lld-link");
+        link_buildvm
+            .current_dir(&src_dir)
+            .arg("/out:buildvm.exe")
+            .arg("buildvm.obj")
+            .arg("buildvm_asm.obj")
+            .arg("buildvm_fold.obj")
+            .arg("buildvm_lib.obj")
+            .arg("buildvm_peobj.obj");
+        self.run_command(&mut link_buildvm)
+            .context(|| format!("Error running '{link_buildvm:?}'"))?;
+
+        Ok(buildvm_exe)
+    }
+
+    fn generate_vm_files(&self, build_dir: &Path, buildvm_exe: &Path) -> Result<(), DynError> {
+        let files_to_generate = [
+            ("peobj", "lj_vm.obj"),
+            ("bcdef", "lj_bcdef.h"),
+            ("ffdef", "lj_ffdef.h"),
+            ("libdef", "lj_libdef.h"),
+            ("recdef", "lj_recdef.h"),
+            ("vmdef", "jit/vmdef.lua"),
+            ("folddef", "lj_folddef.h"),
+        ];
+
+        for (mode, output) in files_to_generate {
+            let mut cmd = Command::new("wine64");
+            cmd.current_dir(build_dir.join("src"))
+                .arg(buildvm_exe)
+                .arg("-m")
+                .arg(mode)
+                .arg("-o")
+                .arg(output);
+
+            if mode != "peobj" && mode != "folddef" {
+                cmd.args([
+                    "lib_base.c",
+                    "lib_math.c",
+                    "lib_bit.c",
+                    "lib_string.c",
+                    "lib_table.c",
+                    "lib_io.c",
+                    "lib_os.c",
+                    "lib_package.c",
+                    "lib_debug.c",
+                    "lib_jit.c",
+                    "lib_ffi.c",
+                    "lib_buffer.c",
+                ]);
+            } else if mode == "folddef" {
+                cmd.arg("lj_opt_fold.c");
+            }
+
+            self.run_command(&mut cmd)
+                .context(|| format!("Error running '{cmd:?}'"))?;
+        }
+
+        Ok(())
+    }
+
+    fn compile_luajit_sources(
+        &self,
+        build_dir: &Path,
+        lua52compat: bool,
+        debug: bool,
+    ) -> Result<(), DynError> {
+        let src_dir = build_dir.join("src");
+        let c_files: Vec<_> = fs::read_dir(&src_dir)
+            .context(|| format!("Cannot read directory '{}'", src_dir.display()))?
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                if path.extension().map_or(false, |ext| ext == "c") {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut compile_luajit = Command::new("clang-cl");
+        compile_luajit
+            .current_dir(&src_dir)
+            .arg("/c")
+            .arg("/I")
+            .arg(&src_dir)
+            .arg("/D_CRT_SECURE_NO_DEPRECATE")
+            .arg("/D_CRT_STDIO_INLINE=__declspec(dllexport)__inline")
+            .arg("/O2")
+            .arg("/W3");
+
+        if debug {
+            compile_luajit.arg("/MTd").arg("/Z7");
+            compile_luajit
+                .arg("/DLUA_USE_ASSERT")
+                .arg("/DLUA_USE_APICHECK");
+        } else {
+            compile_luajit.arg("/MT");
+        }
+        if lua52compat {
+            compile_luajit.arg("/DLUAJIT_ENABLE_LUA52COMPAT");
+        }
+        // See the comment on the minilua compile.
+        compile_luajit.arg("--");
+        compile_luajit.args(&c_files);
+
+        self.run_command(&mut compile_luajit)
+            .context(|| format!("Error running '{compile_luajit:?}'"))?;
+
+        Ok(())
+    }
+
+    fn generate_static_library(&self, build_dir: &Path) -> Result<(), DynError> {
+        let src_dir = build_dir.join("src");
+        let obj_files: Vec<_> = fs::read_dir(&src_dir)
+            .context(|| format!("Cannot read directory '{}'", src_dir.display()))?
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                let file_name = path.file_name()?.to_str()?.to_string();
+                if (file_name.starts_with("lj_") || file_name.starts_with("lib_"))
+                    && file_name.ends_with(".obj")
+                {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut generate_lib = Command::new("llvm-lib");
+        generate_lib
+            .current_dir(&src_dir)
+            .arg("/nologo")
+            .arg("/nodefaultlib")
+            .arg("/out:lua51.lib")
+            .args(&obj_files);
+        self.run_command(&mut generate_lib)
+            .context(|| format!("Error running '{generate_lib:?}'"))?;
+
+        Ok(())
     }
 
     fn run_command(&self, command: &mut Command) -> io::Result<()> {
